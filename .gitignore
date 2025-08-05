@@ -1,0 +1,9 @@
+# Ignorer l’environnement virtuel
+pedro/
+
+# Ignorer les fichiers compilés Python
+__pycache__/
+*.py[cod]
+
+# Ignorer les fichiers spécifiques
+hh.txt
