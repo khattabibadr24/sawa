@@ -1,5 +1,5 @@
-
 import requests
+import json
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
@@ -21,18 +21,24 @@ class QueryProcessor:
             "standard": "Réponds uniquement en français. En utilisant uniquement le contexte ci-dessous, réponds de façon claire à la question suivante.",
             "bullet_points": "Réponds uniquement en français et uniquement avec des bullet points clairs et synthétiques.",
             "friendly": "Réponds uniquement en français. Sois chaleureux et professionnel. Utilise uniquement les informations du contexte.",
-            "understand_first": "Réponds uniquement en français. Avant de répondre, assure-toi d’avoir bien compris le sens de la question. Utilise uniquement le contexte fourni pour formuler une réponse claire et pertinente.",
-            "greeting": "Réponds uniquement en français par un message de bienvenue poli et chaleureux. Exemple : Bonjour ! Comment puis-je vous aider aujourd’hui ?"
+            "understand_first": "Réponds uniquement en français. Avant de répondre, assure-toi d'avoir bien compris le sens de la question. Utilise uniquement le contexte fourni pour formuler une réponse claire et pertinente.",
+            "greeting": "Bonjour ! Comment puis-je vous aider aujourd'hui ? "
         }
 
         self.chat_history = []  
+
     def is_greeting(self, query):
-        greetings = ["bonjour", "salut", "bonsoir", "hello", "coucou"]
-        return any(query.lower().startswith(word) for word in greetings)
+        """Détecte si la requête est une salutation"""
+        greetings = ["bonjour", "salut", "bonsoir", "hello", "coucou", "hi", "hey"]
+        query_lower = query.strip().lower()
+        return any(query_lower.startswith(word) for word in greetings)
+
     def generate_query_embedding(self, query):
+        """Génère l'embedding pour une requête"""
         return self.embedding_model.encode(query).tolist()
 
     def search_qdrant(self, query_embedding, top_k=3):
+        """Recherche dans Qdrant avec l'embedding"""
         results = self.qdrant_client.search(
             collection_name=self.collection_name,
             query_vector=query_embedding,
@@ -40,57 +46,137 @@ class QueryProcessor:
         )
         return results
 
+    def build_messages_with_history(self, user_query, context=None):
+        """Construit les messages pour l'API Mistral en incluant l'historique"""
+        messages = [{"role": "system", "content": "Tu es un assistant expert qui répond de manière claire, concise et utile."}]
+        
+        # Ajouter l'historique des conversations précédentes
+        for msg in self.chat_history:
+            messages.append({"role": "user", "content": msg["user"]})
+            messages.append({"role": "assistant", "content": msg["assistant"]})
+        
+        # Ajouter la nouvelle question avec le contexte si disponible
+        if context:
+            user_content = f"(Contexte : {context})\n\n{user_query}"
+        else:
+            user_content = user_query
+            
+        messages.append({"role": "user", "content": user_content})
+        
+        return messages
+
     def stream_response(self, user_query, prompt_key="standard"):
-        # 👋 Si le message commence par "bonjour", on répond immédiatement
-        if user_query.strip().lower().startswith("bonjour"):
-            yield "Bonjour ! Comment puis-je vous aider aujourd’hui ? 😊"
+        """
+        Méthode principale pour traiter une requête avec streaming.
+        Gère les salutations, la recherche Qdrant, et la continuité de conversation.
+        """
+        print(f"[DEBUG] Requête utilisateur : {user_query}")
+        
+        # 1. Gérer les salutations
+        if self.is_greeting(user_query):
+            polite_response = self.prompts_presets.get("greeting", "Bonjour ! Comment puis-je vous aider aujourd'hui ? 😊")
+            
+            # Stream la réponse caractère par caractère pour simuler le streaming
+            for char in polite_response:
+                yield char
+            
+            # Mettre à jour l'historique pour la salutation
+            self.chat_history.append({
+                "user": user_query,
+                "assistant": polite_response
+            })
             return
 
+        # 2. Recherche dans Qdrant pour les requêtes non-salutations
         query_embedding = self.generate_query_embedding(user_query)
+        print(f"[DEBUG] Embedding généré (5 premiers) : {query_embedding[:5]}")
+        
         search_results = self.search_qdrant(query_embedding)
-
+        
         relevant_texts = []
         for hit in search_results:
+            print(f"[DEBUG] → score = {hit.score}")
             if hit.score >= self.score_threshold:
-                relevant_texts.append(hit.payload['texte_nettoye'])
+                texte = hit.payload.get('texte_nettoye', '')
+                if texte:
+                    relevant_texts.append(texte)
 
+        # 3. Si aucun contexte pertinent n'est trouvé
         if not relevant_texts:
-            yield "Désolé, je n'ai pas trouvé d'informations pertinentes pour votre question."
+            print("[DEBUG] Aucun contexte pertinent trouvé dans Qdrant.")
+            no_context_response = "Désolé, je n'ai pas trouvé d'informations pertinentes pour votre question."
+            
+            for char in no_context_response:
+                yield char
+                
+            # Mettre à jour l'historique
+            self.chat_history.append({
+                "user": user_query,
+                "assistant": no_context_response
+            })
             return
 
-        context = "\n---\n".join(relevant_texts)
-        prompt_instruction = self.prompts_presets.get(prompt_key, prompt_key)
-        prompt = (
-            f"{prompt_instruction}\n\n"
-            f"Contexte : {context}\n\n"
-            f"Question : {user_query}\n\nRéponse :"
-        )
+        # 4. Construire le contexte et les messages avec historique
+        context = "\\n---\\n".join(relevant_texts)
+        messages = self.build_messages_with_history(user_query, context)
+        
+        print(f"[DEBUG] Messages envoyés à Mistral (nombre de messages) : {len(messages)}")
+        print(f"[DEBUG] Dernier message : {messages[-1]['content'][:300]}...")
 
+        # 5. Appel streaming à l'API Mistral
         headers = {
             "Authorization": f"Bearer {self.mistral_api_key}",
             "Content-Type": "application/json"
         }
+        
         data = {
             "model": self.mistral_model,
-            "messages": [
-                {"role": "system", "content": "Tu es un assistant expert qui répond de manière claire et concise."},
-                {"role": "user", "content": prompt}
-            ],
-            "stream": True
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7
         }
 
+        full_response = ""  # Pour stocker la réponse complète
+        
         try:
             response = requests.post(self.api_url, headers=headers, json=data, stream=True)
+            response.raise_for_status()
+            
             for line in response.iter_lines():
                 if line and line.startswith(b"data: "):
-                    chunk = line.decode("utf-8").replace("data: ", "")
-                    if chunk.strip() == "[DONE]":
+                    chunk_data = line.decode("utf-8").replace("data: ", "")
+                    
+                    if chunk_data.strip() == "[DONE]":
                         break
-                    yield chunk + "\n"
+                    
+                    try:
+                        # Parser le JSON du chunk
+                        chunk_json = json.loads(chunk_data)
+                        if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                            delta = chunk_json["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                content = delta["content"]
+                                full_response += content
+                                yield content
+                    except json.JSONDecodeError:
+                        # Ignorer les chunks malformés
+                        continue
+                        
         except Exception as e:
-            yield f"[ERREUR STREAMING MISTRAL] {str(e)}\n"
-    def call_mistral_api_with_messages(self, messages):  # ✅ AJOUT ICI
-        url = "https://api.mistral.ai/v1/chat/completions"
+            error_msg = f"[ERREUR STREAMING MISTRAL] {str(e)}"
+            print(f"[DEBUG] {error_msg}")
+            yield error_msg
+            full_response = error_msg
+
+        # 6. Mettre à jour l'historique avec la réponse complète
+        if full_response:
+            self.chat_history.append({
+                "user": user_query,
+                "assistant": full_response
+            })
+
+    def call_mistral_api_with_messages(self, messages):
+        """Appel non-streaming à l'API Mistral (conservé pour compatibilité)"""
         headers = {
             "Authorization": f"Bearer {self.mistral_api_key}",
             "Content-Type": "application/json"
@@ -102,60 +188,36 @@ class QueryProcessor:
         }
 
         try:
-            response = requests.post(url, headers=headers, json=data)
+            response = requests.post(self.api_url, headers=headers, json=data)
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"]
             else:
                 return f"[Erreur Mistral API] {response.status_code} - {response.text}"
         except Exception as e:
-            return f"[Exception Mistral API] {str(e)}" 
+            return f"[Exception Mistral API] {str(e)}"
+
     def process_query(self, user_query):
-        print(f"[DEBUG] Requête utilisateur : {user_query}")
+        """
+        Méthode héritée pour compatibilité - utilise maintenant stream_response
+        et retourne la réponse complète au lieu de streamer
+        """
+        print(f"[DEBUG] process_query appelé - redirection vers stream_response")
+        
+        # Collecter toute la réponse streamée
+        full_response = ""
+        for chunk in self.stream_response(user_query):
+            full_response += chunk
+            
+        return full_response
 
-    # Générer l'embedding
-        query_embedding = self.generate_query_embedding(user_query)
-        print(f"[DEBUG] Embedding généré (5 premiers) : {query_embedding[:5]}")
+    def get_chat_history(self):
+        """Retourne l'historique des conversations"""
+        return self.chat_history
 
-        # Rechercher les textes pertinents dans Qdrant
-        search_results = self.search_qdrant(query_embedding)
+    def clear_chat_history(self):
+        """Efface l'historique des conversations"""
+        self.chat_history = []
 
-        relevant_texts = []
-        for hit in search_results:
-            print(f"[DEBUG] → score = {hit.score}")
-            if hit.score >= self.score_threshold:
-                texte = hit.payload.get('texte_nettoye', '')
-                if texte:
-                    relevant_texts.append(texte)
-
-        # Si rien de pertinent n’est trouvé
-        if not relevant_texts:
-            print("[DEBUG] Aucun contexte pertinent trouvé dans Qdrant.")
-            return "Désolé, je n'ai pas trouvé d'informations pertinentes pour votre question."
-
-        # Contexte récupéré
-        context = " ".join(relevant_texts)
-
-        # Construction des messages pour le modèle Mistral
-        messages = [{"role": "system", "content": "Tu es un assistant expert qui répond de manière claire, concise et utile."}]
-
-        # Ajoute l’historique (Q&A précédentes)
-        for msg in self.chat_history:
-            messages.append({"role": "user", "content": msg["user"]})
-            messages.append({"role": "assistant", "content": msg["assistant"]})
-
-        # Ajoute la nouvelle question avec le contexte trouvé
-        messages.append({"role": "user", "content": f"(Contexte : {context})\n\n{user_query}"})
-
-        # DEBUG
-        print(f"[DEBUG] Prompt envoyé à Mistral (dernier message) : {messages[-1]['content'][:300]}...")
-
-        # Appel à Mistral API avec tout le fil de conversation
-        response = self.call_mistral_api_with_messages(messages)
-
-        # Ajout dans l’historique pour les futures requêtes
-        self.chat_history.append({
-            "user": user_query,
-            "assistant": response
-        })
-
-        return response
+    def set_chat_history(self, history):
+        """Définit l'historique des conversations"""
+        self.chat_history = history
