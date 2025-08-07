@@ -5,8 +5,10 @@ RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
+    && pip show uvicorn \
     && pip install --no-cache-dir pip-audit \
     && pip-audit || true
+
 
 COPY ./app ./app
 
