@@ -1,19 +1,18 @@
-# Utilise l'image officielle Python 3.12
-FROM python:3.12
+FROM python:3.12-slim-bullseye
 
-# Définit le dossier de travail dans le conteneur
-WORKDIR /app
+RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copie les dépendances et installe-les
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir pip-audit \
+    && pip-audit || true
 
-# Copie le code source dans le conteneur
 COPY ./app ./app
 
-# Expose le port FastAPI
+RUN useradd -m appuser
+USER appuser
+
 EXPOSE 8000
 
-# Lance FastAPI via Uvicorn
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
