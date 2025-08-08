@@ -5,5 +5,8 @@ pedro/
 __pycache__/
 *.py[cod]
 
+
 # Ignorer les fichiers spécifiques
 hh.txt
+Dockerfile
+docker-compose.yml
