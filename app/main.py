@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from data_preparation import DataPreparation
-from query_processor import QueryProcessor
+from app.data_preparation import DataPreparation
+from app.query_processor import QueryProcessor
 
 app = FastAPI()
 
